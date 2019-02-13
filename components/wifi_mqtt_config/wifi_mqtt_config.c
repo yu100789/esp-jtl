@@ -2,22 +2,19 @@
 
 static const char* TAG = "wifi";
 
-esp_mqtt_client_handle_t user_client = 0;
+esp_mqtt_client_handle_t user_client = NULL;
 wifi_config_t* wifi_config;
 static wifi_state_t wifistate = 0;
 static char mac_buf[6];
 static EventGroupHandle_t wifi_event_group;
 const static int CONNECTED_BIT = BIT0;
 static const int ESPTOUCH_DONE_BIT = BIT1;
-
 static int s_retry_num = 0;
-static TaskHandle_t wificount_handle = NULL;
 static TaskHandle_t smartconfig_example_task_handle = NULL;
 static QueueHandle_t xQueue_send;
 
 static void mqtt_app_start(void);
 static void smartconfig_example_task(void* parm);
-static void wificount(void* parm);
 
 static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 {
@@ -42,9 +39,8 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
         esp_mqtt_client_subscribe(event->client, heater_power, 1);
         break;
     case MQTT_EVENT_DISCONNECTED:
-        wifistate = WIFI_DISCONNECT;
+        wifistate = WIFI_CONNECTED;
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
-        esp_wifi_disconnect();
         break;
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
@@ -61,9 +57,10 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
         judgement(event->data_len, event->data, event->topic_len);
         break;
     case MQTT_EVENT_ERROR:
-        wifistate = WIFI_DISCONNECT;
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
-        esp_wifi_disconnect();
+        break;
+    case MQTT_EVENT_BEFORE_CONNECT:
+        ESP_LOGE(TAG, "MQTT_EVENT_BEFORE_CONNECT");
         break;
     }
     return ESP_OK;
@@ -77,25 +74,6 @@ void mqtt_send(const char* data, const char* topic, int retain)
         ESP_LOGE(TAG, "WIFI NOT CONNECT %s", data);
     }
 }
-static void wificount(void* parm)
-{
-    wifi_bandwidth_t bw;
-    ESP_ERROR_CHECK(esp_wifi_get_bandwidth(ESP_IF_WIFI_STA, &bw));
-    ESP_LOGI(TAG, "WIFI BANDWIDTH : %d", bw * 20);
-    esp_wifi_connect();
-    vTaskDelay(pdMS_TO_TICKS(15000));
-    // esp_wifi_stop();
-    // esp_wifi_deinit();
-    // ESP_LOGI(TAG, "ESP_WIFI_MODE_AP");
-    // wifi_init_softap();
-    if (smartconfig_example_task_handle != NULL) {
-        vTaskDelete(smartconfig_example_task_handle);
-        smartconfig_example_task_handle = NULL;
-    }
-    xTaskCreate(smartconfig_example_task, "smartconfig_example_task", 1024 * 4, NULL, 6, &smartconfig_example_task_handle);
-    wificount_handle = NULL;
-    vTaskDelete(NULL);
-}
 static esp_err_t wifi_event_handler(void* ctx, system_event_t* event)
 {
     switch (event->event_id) {
@@ -108,35 +86,39 @@ static esp_err_t wifi_event_handler(void* ctx, system_event_t* event)
         ESP_LOGI(TAG, "station:" MACSTR "leave, AID=%d", MAC2STR(event->event_info.sta_disconnected.mac), event->event_info.sta_disconnected.aid);
         break;
     case SYSTEM_EVENT_STA_START:
-        if (wificount_handle == NULL)
-            xTaskCreate(wificount, "wificount", 1024 * 8, 0, 0, &wificount_handle);
+        if(ESP_ERR_WIFI_SSID == esp_wifi_connect()){
+            if (smartconfig_example_task_handle == NULL){
+                xTaskCreate(smartconfig_example_task, "smartconfig_example_task", 1024 * 4, NULL, 6, &smartconfig_example_task_handle);
+            }
+        }
         break;
     case SYSTEM_EVENT_STA_GOT_IP:
         wifistate = WIFI_CONNECTED;
         xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
         mqtt_app_start();
-        if (wificount_handle != NULL) {
-            vTaskDelete(wificount_handle);
-            wificount_handle = NULL;
-        }
+        s_retry_num = 0;
         break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
         wifistate = WIFI_DISCONNECT;
         ESP_LOGE(TAG, "DISCONNECT REASON : %d", event->event_info.disconnected.reason);
-        if (s_retry_num < 10) {
-            esp_wifi_connect();
-            xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
+        xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
+        esp_wifi_connect();
+        if (s_retry_num < 5) {
             s_retry_num++;
             ESP_LOGI(TAG, "retry to connect to the AP");
         } else {
-            if (wificount_handle == NULL)
-                xTaskCreate(wificount, "wificount", 1024 * 8, 0, 0, &wificount_handle);
+           if (smartconfig_example_task_handle != NULL){
+                vTaskDelete(smartconfig_example_task_handle);
+                smartconfig_example_task_handle = NULL;
+            }
+            xTaskCreate(smartconfig_example_task, "smartconfig_example_task", 1024 * 4, NULL, 6, &smartconfig_example_task_handle);
+            s_retry_num = 0;
+        }
+        if (user_client != NULL) {
+            esp_mqtt_client_destroy(user_client);
+            user_client = NULL;
         }
         ESP_LOGI(TAG, "connect to the AP fail\n");
-        if (event->event_info.disconnected.reason >= 8 && event->event_info.disconnected.reason != 201)
-            esp_restart();
-        if (user_client != 0)
-            esp_mqtt_client_stop(user_client);
         break;
     default:
         break;
@@ -145,7 +127,8 @@ static esp_err_t wifi_event_handler(void* ctx, system_event_t* event)
 }
 static void mqtt_app_start(void)
 {
-    const esp_mqtt_client_config_t mqtt_cfg = { .host = MQTT_HOST_IP,
+    const esp_mqtt_client_config_t mqtt_cfg = { 
+        .host = MQTT_HOST_IP,
         .port = MQTT_HOST_PORT,
         .keepalive = 180,
         .disable_auto_reconnect = false,
@@ -203,12 +186,11 @@ static void smartconfig_example_task(void* parm)
 {
     EventBits_t uxBits;
     ESP_ERROR_CHECK(esp_smartconfig_stop());
-    // ESP_ERROR_CHECK(esp_esptouch_set_timeout(60));
+    ESP_ERROR_CHECK(esp_esptouch_set_timeout(60));
     ESP_ERROR_CHECK(esp_smartconfig_set_type(SC_TYPE_ESPTOUCH));
-    // ESP_ERROR_CHECK(esp_smartconfig_fast_mode(false));
     ESP_ERROR_CHECK(esp_smartconfig_start(sc_callback));
     while (1) {
-        uxBits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT | ESPTOUCH_DONE_BIT, true, false, portMAX_DELAY);
+        uxBits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT | ESPTOUCH_DONE_BIT, true, false, pdMS_TO_TICKS(100000));
         if (uxBits & CONNECTED_BIT) {
             ESP_LOGI(TAG, "WiFi Connected to ap");
         }
@@ -217,6 +199,10 @@ static void smartconfig_example_task(void* parm)
             esp_smartconfig_stop();
             smartconfig_example_task_handle = NULL;
             vTaskDelete(NULL);
+        }
+        if (uxBits == 0){
+            ESP_LOGI(TAG,"SmartLink Timeout");
+            esp_restart();
         }
     }
 }
@@ -227,17 +213,19 @@ static void wifi_state_event(void* parm)
     while (1) {
         switch (wifistate) {
         case WIFI_DISCONNECT:
-            gpio_set_level(WIFI_LED, 0);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            gpio_set_level(WIFI_LED, 1);
+            vTaskDelay(pdMS_TO_TICKS(300));
             break;
         case WIFI_CONNECTED:
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(1000));
             gpio_set_level(WIFI_LED, 1);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(1000));
             break;
         case WIFI_MQTT_CONNECTED:
-            vTaskDelay(pdMS_TO_TICKS(250));
+            vTaskDelay(pdMS_TO_TICKS(500));
             gpio_set_level(WIFI_LED, 1);
-            vTaskDelay(pdMS_TO_TICKS(250));
+            vTaskDelay(pdMS_TO_TICKS(500));
             break;
         case SMARTCONFIGING:
             vTaskDelay(pdMS_TO_TICKS(100));

@@ -23,6 +23,6 @@
 
 #define WIFI_BAND WIFI_BW_HT20
 
-#define WIFI_LED 23
+#define WIFI_LED 2
 
 #endif

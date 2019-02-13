@@ -4,8 +4,8 @@ static const char* tag = "JTL";
 static jtl_cmda1_t jtl_a1_data;
 static jtl_cmda2_t jtl_a2_data;
 static char *gotip, mac_buf[6];
-static uint8_t cmd_b8[16] = { 0x55, 0x01, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xB8, 0xAA, 0xAA, 0xAA, 0xAA, 0x80, 0x00, 0xAA, 0xAA };
-static uint8_t prior_heater = 0;
+static uint8_t cmd_b8[16] = { 0x55, 0x01, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xB8, 0xAA, 0xAA, 0xAA, 0xAA, 0x00, 0x00, 0xAA, 0xAA };
+static uint8_t prior_heater = 0, heaterPower = 1;
 static int json_temp = 0;
 static TaskHandle_t control_countHandle = NULL;
 static void control_count(void* parm);
@@ -63,6 +63,17 @@ bool set_heaterprior(void)
     }
     return false;
 }
+void set_heaterPower(uint8_t new_power)
+{
+    if (new_power != heaterPower) {
+        ESP_LOGI(tag, "Heater power changed");
+        heaterPower = new_power;
+        if (heaterPower == 1)
+            esp_mqtt_client_publish(getClientHandle(), connect_status, "connected", 9, 1, 1);
+        else if (heaterPower == 0)
+            esp_mqtt_client_publish(getClientHandle(), connect_status, "offline", 7, 1, 1);
+    }
+}
 uint8_t get_heaterprior(uint8_t state)
 {
     if (prior_heater == 0) {
@@ -80,23 +91,23 @@ static void control_count(void* parm)
 {
     ESP_LOGI(tag, "CONTROL CONUNT TASK START, CONTENT:\n  %d SECONDS LEFT", (int)parm);
     int survive = (int)parm;
-    int i = 0;
+    uint16_t i = 0;
     if (survive >= 0) {
         i = survive;
     } else {
         ESP_LOGE(tag, "CONTROL CONUNT TASK ERROR %d", i);
-        goto FAIL;
+        goto OVER;
     }
-    while (i >= 0) {
-        ESP_LOGI(tag, "CONTROL SURVIVE: %ds REMAIN", i--);
+    while (i-- > 0) {
+        ESP_LOGI(tag, "CONTROL SURVIVE: %ds REMAIN", i);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+OVER:
     ESP_LOGI(tag, "CONTROL SURVIVE OVER");
     prior_heater = 0;
     esp_mqtt_client_publish(
         getClientHandle(), control_state, "{\"control\":\"0\",\"survive\":\"0\"}", strlen("{\"control\":\"0\",\"survive\":\"0\"}"), 0, 1);
     xQueueSend(getUartQueueHandle(), (void*)cmd_b8, pdMS_TO_TICKS(0));
-FAIL:
     control_countHandle = NULL;
     vTaskDelete(NULL);
 }
@@ -108,17 +119,23 @@ void judgement(int data_len, const char* event_data, int topic_len)
         int control = atoi(cJSON_GetObjectItem(json_data, "control")->valuestring);
         int survive = atoi(cJSON_GetObjectItem(json_data, "survive")->valuestring);
         if (control != 0) {
-            if (control_countHandle == NULL) {
-                prior_heater = control;
-                ESP_LOGI(tag, "prior change to:%d", prior_heater);
+            if (control == prior_heater) {
+                if (control_countHandle != NULL) {
+                    ESP_LOGI(tag, "CONRTROL COUNT TASK HAD BEEN CREATED , Remove old task");
+                    vTaskDelete(control_countHandle);
+                    control_countHandle = NULL;
+                }
                 xTaskCreate(control_count, "control_count", 1024 * 3, (void*)survive, 0, &control_countHandle);
             } else {
-                ESP_LOGI(tag, "CONRTROL COUNT TASK HAD BEEN CREATED , Remove old task");
-                vTaskDelete(control_countHandle);
-                control_countHandle = NULL;
-                xTaskCreate(control_count, "control_count", 1024 * 3, (void*)survive, 0, &control_countHandle);
+                if (control_countHandle == NULL) {
+                    prior_heater = control;
+                    ESP_LOGI(tag, "prior change to:%d", prior_heater);
+                    xTaskCreate(control_count, "control_count", 1024 * 3, (void*)survive, 0, &control_countHandle);
+                } else {
+                    ESP_LOGE(tag, "recv new control, but prior had been taken");
+                }
             }
-        } else if (control == 0 && survive == 0) {
+        } else {
             if (control_countHandle != NULL) {
                 vTaskDelete(control_countHandle);
                 control_countHandle = NULL;
@@ -133,24 +150,36 @@ void judgement(int data_len, const char* event_data, int topic_len)
         ESP_LOGI(tag, "user: %d", user);
         if (user == 2) {
             ESP_LOGI(tag, "current prior:%d", prior_heater);
-
             xQueueSend(getUartQueueHandle(), (void*)cmd_b8, pdMS_TO_TICKS(0));
         } else {
             ESP_LOGI(tag, "user hasn't been auth");
         }
-    } else {
-        static uint8_t cmd_b9[16] = { 0x55, 0x01, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xB9, 0xAA, 0xAA, 0xAA, 0xAA, 0x80, 0x00, 0xAA, 0xAA };
+    } else if (topic_len == strlen(heater_power)) {
+        if (strncmp(event_data, "offline", 7) == 0) {
+            ESP_LOGI(tag, "get power off mesg");
+            esp_mqtt_client_publish(getClientHandle(), connect_status, "offline", 7, 1, 1);
+            heaterPower = 0;
+            xQueueSend(getUartQueueHandle(), (void*)cmd_b8, pdMS_TO_TICKS(0));
+        } else if (strncmp(event_data, "online", 6) == 0) {
+            ESP_LOGI(tag, "get power on mesg");
+            esp_mqtt_client_publish(getClientHandle(), connect_status, "connected", 9, 1, 1);
+            heaterPower = 1;
+            xQueueSend(getUartQueueHandle(), (void*)cmd_b8, pdMS_TO_TICKS(0));
+        }
+    } else if (topic_len == strlen(rules_topic_water)) {
+        static uint8_t cmd_b9[16] = { 0x55, 0x01, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xB9, 0xAA, 0xAA, 0xAA, 0xAA, 0x00, 0x00, 0xAA, 0xAA };
         unsigned long water = strtoul(event_data, NULL, 10);
         cmd_b9[8] = water >> 8;
         cmd_b9[9] = water;
         if (prior_heater != 1) {
             ESP_LOGI(tag, "current prior:%d", prior_heater);
             cmd_b9[12] |= 0x04;
-
             xQueueSend(getUartQueueHandle(), (void*)cmd_b9, pdMS_TO_TICKS(0));
         } else {
             ESP_LOGI(tag, "no prior,cancel cmd sending");
         }
+    } else {
+        ESP_LOGE(tag, "error : cannot match the topic");
     }
     cJSON_Delete(json_data);
     ESP_LOGI(tag, "free memory : %d Bytes", esp_get_free_heap_size());
@@ -165,6 +194,7 @@ void jtl_send_task(void* parm)
             ESP_LOG_BUFFER_HEX(tag, data, 16);
             if (data[7] == 0xA1 || data[7] == 0xA2) {
                 data[7] += 0x10;
+                set_heaterPower(data[12] >> 7);
                 data[12] = get_heaterprior(data[12]);
                 data[14] = crc_high_first(data, 14);
                 uart_write_bytes(UART_NUM_1, (const char*)data, 16);
@@ -216,6 +246,7 @@ void jtl_send_task(void* parm)
                 }
                 free(buf);
             } else if (data[7] == 0xB8 || data[7] == 0xB9) {
+                data[12] |= heaterPower << 7;
                 data[12] = get_heaterprior(data[12]);
                 data[14] = crc_high_first(data, 14);
                 uart_write_bytes(UART_NUM_1, (const char*)data, 16);

@@ -7,4 +7,3 @@ PROJECT_NAME := esp-jtl
 IOT_SOLUTION_PATH ?= $(abspath $(shell pwd)/../../)
 EXTRA_COMPONENT_DIRS += $(PROJECT_PATH)/../../../
 include $(IDF_PATH)/make/project.mk
-include $(IOT_SOLUTION_PATH)/components/component_conf.mk
